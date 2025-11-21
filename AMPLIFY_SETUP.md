@@ -61,8 +61,8 @@ frontend:
 
    | Variable Name | Value |
    |--------------|-------|
-   | `LANGFUSE_PUBLIC_KEY` | `pk-lf-50be1409-472b-4f83-844f-07816f3cc521` |
-   | `LANGFUSE_SECRET_KEY` | `sk-lf-2767ada8-06a5-4b95-9ad4-b5aaaca51504` |
+   | `LANGFUSE_PUBLIC_KEY` | `pk-lf-your-public-key-here` |
+   | `LANGFUSE_SECRET_KEY` | `sk-lf-your-secret-key-here` |
    | `LANGFUSE_BASE_URL` | `https://us.cloud.langfuse.com` |
 
 5. **Mark them as "Secure"** (lock icon) - this encrypts them at rest
