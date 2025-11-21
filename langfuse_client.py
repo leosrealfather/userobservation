@@ -306,11 +306,44 @@ def fetch_traces_by_company(
                             except:
                                 timestamp = datetime.now()
                     
+                    # Extract success/failure from metadata.tools
+                    success_count = 0
+                    failure_count = 0
+                    if isinstance(trace_metadata, dict):
+                        tools_data = trace_metadata.get('tools', {})
+                        if isinstance(tools_data, dict):
+                            success_count = tools_data.get('successful', 0) or 0
+                            failure_count = tools_data.get('failed', 0) or 0
+                    else:
+                        try:
+                            tools_data = getattr(trace_metadata, 'tools', None)
+                            if tools_data:
+                                if isinstance(tools_data, dict):
+                                    success_count = tools_data.get('successful', 0) or 0
+                                    failure_count = tools_data.get('failed', 0) or 0
+                                else:
+                                    success_count = getattr(tools_data, 'successful', 0) or 0
+                                    failure_count = getattr(tools_data, 'failed', 0) or 0
+                        except:
+                            pass
+                    
+                    # Convert to integers
+                    try:
+                        success_count = int(success_count) if success_count else 0
+                    except (ValueError, TypeError):
+                        success_count = 0
+                    try:
+                        failure_count = int(failure_count) if failure_count else 0
+                    except (ValueError, TypeError):
+                        failure_count = 0
+                    
                     traces.append({
                         'company_name': str(company_name),
                         'conversation_id': str(conversation_id) if conversation_id else f"trace_{trace_id}",
                         'trace_id': str(trace_id),
-                        'timestamp': timestamp
+                        'timestamp': timestamp,
+                        'success_count': success_count,
+                        'failure_count': failure_count
                     })
                 
                 # Check if there are more pages
@@ -400,15 +433,272 @@ def aggregate_company_conversations(traces: List[Dict]) -> pd.DataFrame:
     }).reset_index()
     tool_call_counts.columns = ['Company', 'Number of Tool Calls']
     
-    # Merge the two metrics
-    aggregated = conversation_counts.merge(tool_call_counts, on='Company', how='outer').fillna(0)
+    # Aggregate success and failure counts per company
+    if 'success_count' in df.columns and 'failure_count' in df.columns:
+        success_failure_counts = df.groupby('company_name').agg({
+            'success_count': 'sum',
+            'failure_count': 'sum'
+        }).reset_index()
+        success_failure_counts.columns = ['Company', 'Success Count', 'Failure Count']
+    else:
+        # If no success/failure data, set to 0
+        success_failure_counts = tool_call_counts[['Company']].copy()
+        success_failure_counts['Success Count'] = 0
+        success_failure_counts['Failure Count'] = 0
+    
+    # Merge all metrics
+    aggregated = conversation_counts.merge(tool_call_counts, on='Company', how='outer')
+    aggregated = aggregated.merge(success_failure_counts, on='Company', how='outer').fillna(0)
     
     # Convert to integers
     aggregated['Number of Conversations'] = aggregated['Number of Conversations'].astype(int)
     aggregated['Number of Tool Calls'] = aggregated['Number of Tool Calls'].astype(int)
+    aggregated['Success Count'] = aggregated['Success Count'].astype(int)
+    aggregated['Failure Count'] = aggregated['Failure Count'].astype(int)
     
     # Sort by number of conversations (descending)
     aggregated = aggregated.sort_values('Number of Conversations', ascending=False)
+    
+    return aggregated
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def fetch_tool_calls_by_company(
+    _client: Langfuse,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None
+) -> List[Dict]:
+    """
+    Fetch individual tool calls from Langfuse traces.
+    Extracts tool_name and success status from trace output.tool_call.
+    
+    Args:
+        _client: Langfuse client instance
+        start_time: Start datetime for filtering
+        end_time: End datetime for filtering
+    
+    Returns:
+        List of tool call dictionaries with company_name, tool_name, success, timestamp
+    """
+    if _client is None:
+        return []
+    
+    try:
+        # First, fetch traces to get trace IDs and company info
+        traces = fetch_traces_by_company(_client, start_time, end_time)
+        if not traces:
+            return []
+        
+        # Get credentials for API calls
+        public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+        secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+        host = os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+        
+        # Fall back to Streamlit secrets if env vars not set
+        if not public_key or not secret_key:
+            try:
+                langfuse_config = st.secrets.get("langfuse", {})
+                public_key = public_key or langfuse_config.get("public_key", "")
+                secret_key = secret_key or langfuse_config.get("secret_key", "")
+                if host == "https://cloud.langfuse.com":
+                    host = langfuse_config.get("host", host)
+            except Exception:
+                pass
+        
+        if not public_key or not secret_key:
+            return []
+        
+        # Setup authentication
+        auth_string = f"{public_key}:{secret_key}"
+        auth_bytes = auth_string.encode('ascii')
+        auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+        headers = {
+            'Authorization': f'Basic {auth_b64}',
+            'Content-Type': 'application/json'
+        }
+        
+        tool_calls = []
+        
+        # Fetch full trace details to extract tool_call from output
+        for trace in traces:
+            trace_id = trace.get('trace_id', '')
+            company_name = trace.get('company_name', 'Unknown Company')
+            trace_timestamp = trace.get('timestamp', datetime.now())
+            
+            if not trace_id:
+                continue
+            
+            try:
+                # Fetch full trace details
+                url = f"{host}/api/public/traces/{trace_id}"
+                response = requests.get(url, headers=headers, timeout=10)
+                
+                if response.status_code == 200:
+                    trace_data = response.json()
+                    
+                    # Extract tool_call from output
+                    # Check various possible locations for output
+                    output = (
+                        trace_data.get('output') or
+                        trace_data.get('outputs') or
+                        (trace_data.get('observations', []) if isinstance(trace_data.get('observations'), list) else None)
+                    )
+                    
+                    # Handle different output formats
+                    tool_call_list = []
+                    
+                    if isinstance(output, dict):
+                        # If output is a dict, look for tool_call field
+                        tool_call = output.get('tool_call') or output.get('tool_calls')
+                        if tool_call:
+                            if isinstance(tool_call, list):
+                                tool_call_list = tool_call
+                            else:
+                                tool_call_list = [tool_call]
+                    elif isinstance(output, list):
+                        # If output is a list, check each item for tool_call
+                        for item in output:
+                            if isinstance(item, dict):
+                                tool_call = item.get('tool_call') or item.get('tool_calls')
+                                if tool_call:
+                                    if isinstance(tool_call, list):
+                                        tool_call_list.extend(tool_call)
+                                    else:
+                                        tool_call_list.append(tool_call)
+                    elif isinstance(output, str):
+                        # If output is a string, try to parse as JSON
+                        try:
+                            import json
+                            parsed_output = json.loads(output)
+                            if isinstance(parsed_output, dict):
+                                tool_call = parsed_output.get('tool_call') or parsed_output.get('tool_calls')
+                                if tool_call:
+                                    if isinstance(tool_call, list):
+                                        tool_call_list = tool_call
+                                    else:
+                                        tool_call_list = [tool_call]
+                        except:
+                            pass
+                    
+                    # Also check if tool_call is directly in trace_data
+                    if not tool_call_list:
+                        tool_call = trace_data.get('tool_call') or trace_data.get('tool_calls')
+                        if tool_call:
+                            if isinstance(tool_call, list):
+                                tool_call_list = tool_call
+                            else:
+                                tool_call_list = [tool_call]
+                    
+                    # Extract tool_name and success from each tool_call
+                    for tool_call_item in tool_call_list:
+                        if not isinstance(tool_call_item, dict):
+                            continue
+                        
+                        # Extract tool_name
+                        tool_name = (
+                            tool_call_item.get('tool_name') or
+                            tool_call_item.get('toolName') or
+                            tool_call_item.get('name') or
+                            'Unknown Tool'
+                        )
+                        
+                        # Extract success status
+                        success = tool_call_item.get('success')
+                        if success is None:
+                            # Default to True if not specified
+                            success = True
+                        else:
+                            # Convert to boolean
+                            success = bool(success)
+                        
+                        tool_calls.append({
+                            'company_name': company_name,
+                            'tool_name': str(tool_name),
+                            'success': success,
+                            'timestamp': trace_timestamp
+                        })
+                
+                elif response.status_code == 404:
+                    # Trace not found, skip
+                    continue
+                else:
+                    # Skip this trace if we can't fetch it
+                    continue
+                    
+            except requests.exceptions.RequestException:
+                # Skip this trace if there's a network error
+                continue
+            except Exception as e:
+                # Skip this trace on any other error
+                if 'debug_info' not in st.session_state:
+                    st.session_state.debug_info = []
+                st.session_state.debug_info.append(f"Error processing trace {trace_id}: {str(e)}")
+                continue
+        
+        # Debug: Log results
+        if 'debug_info' not in st.session_state:
+            st.session_state.debug_info = []
+        if tool_calls:
+            st.session_state.debug_info.append(f"Successfully fetched {len(tool_calls)} tool calls from trace output")
+        else:
+            st.session_state.debug_info.append("No tool calls found in trace output")
+        
+        return tool_calls
+        
+    except Exception as e:
+        if 'debug_info' not in st.session_state:
+            st.session_state.debug_info = []
+        st.session_state.debug_info.append(f"Error fetching tool calls: {str(e)}")
+        st.error(f"Failed to fetch tool calls from Langfuse: {str(e)}")
+        import traceback
+        st.debug(traceback.format_exc())
+        return []
+
+
+def aggregate_tool_calls_by_name(tool_calls: List[Dict]) -> pd.DataFrame:
+    """
+    Aggregate tool call data by company and tool name.
+    Excludes test companies and calculates success rates.
+    
+    Args:
+        tool_calls: List of tool call dictionaries with company_name, tool_name, success
+    
+    Returns:
+        DataFrame with columns: Company, Tool Name, Total Calls, Successful, Failed, Success Rate (%)
+    """
+    if not tool_calls:
+        return pd.DataFrame(columns=['Company', 'Tool Name', 'Total Calls', 'Successful', 'Failed', 'Success Rate (%)'])
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(tool_calls)
+    
+    # Filter out test companies (case-insensitive)
+    df = df[~df['company_name'].str.lower().isin([c.lower() for c in TEST_COMPANIES])]
+    
+    if len(df) == 0:
+        return pd.DataFrame(columns=['Company', 'Tool Name', 'Total Calls', 'Successful', 'Failed', 'Success Rate (%)'])
+    
+    # Group by company and tool name, count successes and failures
+    aggregated = df.groupby(['company_name', 'tool_name']).agg({
+        'success': ['count', 'sum']  # count = total, sum = successful (True = 1, False = 0)
+    }).reset_index()
+    
+    # Flatten column names
+    aggregated.columns = ['Company', 'Tool Name', 'Total Calls', 'Successful']
+    
+    # Calculate failed calls
+    aggregated['Failed'] = aggregated['Total Calls'] - aggregated['Successful']
+    
+    # Calculate success rate
+    aggregated['Success Rate (%)'] = (aggregated['Successful'] / aggregated['Total Calls'] * 100).round(1)
+    
+    # Convert to integers
+    aggregated['Total Calls'] = aggregated['Total Calls'].astype(int)
+    aggregated['Successful'] = aggregated['Successful'].astype(int)
+    aggregated['Failed'] = aggregated['Failed'].astype(int)
+    
+    # Sort by company, then by total calls (descending)
+    aggregated = aggregated.sort_values(['Company', 'Total Calls'], ascending=[True, False])
     
     return aggregated
 
