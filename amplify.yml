@@ -1,0 +1,16 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - echo "Building Streamlit Docker container..."
+    build:
+      commands:
+        - echo "Dockerfile will be used by Amplify"
+  artifacts:
+    baseDirectory: /
+    files:
+      - '**/*'
+  cache:
+    paths: []
+
