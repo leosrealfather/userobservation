@@ -360,7 +360,7 @@ TEST_COMPANIES = {
     'vandelayindustries', 'redbull', 'avery', 'averymagoriumswonderemporium',
     'holly', 'unknown company', 'finaltest', 'leotest',
     'tombroschinskydigitallic', 'tombroschinskydigitalllc', 'wawa', 'agoodcompany',
-    'tesla', 'pacarana', 'apple', 'prada', 'bruce'
+    'tesla', 'pacarana', 'apple', 'prada', 'bruce', 'intuit'
 }
 
 
