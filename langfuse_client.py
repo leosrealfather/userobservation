@@ -87,11 +87,22 @@ def get_time_range_filter(time_period: str, custom_start: Optional[datetime] = N
         Tuple of (start_datetime, end_datetime) - timezone-aware in local timezone
     """
     # Get current time in local timezone (timezone-aware)
+    # On Streamlit Cloud, the server runs in UTC, so we need to handle that case
     import time
-    local_offset_seconds = time.timezone if (time.daylight == 0) else time.altzone
-    local_offset = timedelta(seconds=-local_offset_seconds)
-    local_tz = timezone(local_offset)
-    now = datetime.now(local_tz)
+    try:
+        # Try to get the actual local timezone
+        local_offset_seconds = time.timezone if (time.daylight == 0) else time.altzone
+        local_offset = timedelta(seconds=-local_offset_seconds)
+        local_tz = timezone(local_offset)
+        now = datetime.now(local_tz)
+        
+        # If we're in UTC (offset is 0), we might be on a server in UTC
+        # In that case, we should use UTC for calculations but this is fine
+        # The data in Langfuse is stored in UTC anyway
+    except Exception:
+        # Fallback to UTC if timezone detection fails
+        local_tz = timezone.utc
+        now = datetime.now(timezone.utc)
     
     if time_period == "today":
         # Last 24 hours instead of from midnight
@@ -100,9 +111,14 @@ def get_time_range_filter(time_period: str, custom_start: Optional[datetime] = N
         end = now + timedelta(minutes=1)  # Add 1 minute buffer to ensure we get recent data
     elif time_period == "this_week":
         # Start of week (Monday)
-        days_since_monday = now.weekday()
-        start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
-        end = now
+        # Always calculate in UTC for consistency across server timezones
+        # This ensures the same week boundaries regardless of where the server is located
+        now_utc = now.astimezone(timezone.utc) if now.tzinfo != timezone.utc else now
+        days_since_monday = now_utc.weekday()
+        start_utc = (now_utc - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Keep in UTC - will be converted to UTC again in API call, but this ensures consistency
+        start = start_utc
+        end = now_utc
     elif time_period == "this_month":
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         end = now
