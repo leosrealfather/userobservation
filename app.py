@@ -11,12 +11,14 @@ from langfuse_client import (
     aggregate_company_conversations,
     fetch_tool_calls_by_company,
     aggregate_tool_calls_by_name,
+    fetch_conversation_outcomes,
+    aggregate_conversation_outcomes,
     get_time_range_filter
 )
 
 # Page configuration
 st.set_page_config(
-    page_title="Company Conversation Dashboard",
+    page_title="Agent Observability",
     page_icon="📊",
     layout="wide"
 )
@@ -28,7 +30,7 @@ if 'last_refresh' not in st.session_state:
 # Title with refresh button inline
 col_title, col_refresh = st.columns([5, 1])
 with col_title:
-    st.title("📊 Company Conversation Activity Dashboard")
+    st.title("Agent Observability")
 with col_refresh:
     st.write("")  # Spacing
     st.write("")  # Spacing
@@ -80,7 +82,7 @@ if client is None:
     st.stop()
 
 # Create tabs for different views
-tab1, tab2 = st.tabs(["Company Overview", "Tool Call Breakdown"])
+tab1, tab2, tab3 = st.tabs(["Company Overview", "Tool Call Breakdown", "True Agent Success/Failure"])
 
 # Tab 1: Company Overview (existing dashboard)
 with tab1:
@@ -489,6 +491,91 @@ with tab2:
         - **Have there been any traces in the selected time period?** (Most likely cause)
         - Langfuse API credentials are correct
         - Tool calls have tool_name and success data in their metadata
+        - Network connectivity to Langfuse
+        """)
+
+# Tab 3: Conversation Success/Failure
+with tab3:
+    # Fetch conversation outcomes with loading indicator
+    try:
+        with st.spinner("Fetching conversation outcomes from Langfuse (this may take a minute for large datasets)..."):
+            conversations = fetch_conversation_outcomes(
+                _client=client,
+                start_time=start_time,
+                end_time=end_time
+            )
+    except Exception as e:
+        st.error(f"Error fetching conversation outcomes: {str(e)}")
+        import traceback
+        with st.expander("Error Details"):
+            st.code(traceback.format_exc())
+        conversations = []
+    
+    if conversations:
+        # Create DataFrame from conversations
+        conv_df = pd.DataFrame(conversations)
+        
+        # Sort: Failed first, then by timestamp (most recent first)
+        conv_df['outcome_sort'] = conv_df['outcome'].map({'failed': 0, 'success': 1})
+        conv_df = conv_df.sort_values(['outcome_sort', 'timestamp'], ascending=[True, False])
+        
+        # Select and prepare columns for display
+        display_df = conv_df[['conversation_id', 'company_name', 'outcome', 'prompt_message', 'final_meta_tool', 'trace_id', 'timestamp']].copy()
+        display_df.columns = ['Conversation ID', 'Company', 'Outcome', 'Prompt Message', 'Final Meta Tool', 'Trace ID', 'Timestamp']
+        
+        # Format outcome for display
+        display_df['Outcome'] = display_df['Outcome'].str.capitalize()
+        
+        # Truncate prompt message (first 50 words)
+        def truncate_message(msg):
+            if pd.isna(msg) or not msg:
+                return ''
+            words = str(msg).split()
+            if len(words) > 50:
+                return ' '.join(words[:50]) + '...'
+            return ' '.join(words)
+        
+        display_df['Prompt Message'] = display_df['Prompt Message'].apply(truncate_message)
+        
+        # Format timestamp
+        def format_timestamp(ts):
+            if isinstance(ts, datetime):
+                return ts.strftime('%Y-%m-%d %H:%M:%S')
+            elif isinstance(ts, str):
+                try:
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    return dt.strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    return str(ts)
+            return str(ts)
+        
+        display_df['Timestamp'] = display_df['Timestamp'].apply(format_timestamp)
+        
+        # Color code: Darker red for failed, darker green for successful, with white text
+        def color_outcome(val):
+            if val == 'Failed':
+                return 'background-color: #cc0000; color: white'  # Darker red
+            return 'background-color: #006600; color: white'  # Darker green
+        
+        # Display table
+        st.dataframe(
+            display_df.style.applymap(color_outcome, subset=['Outcome']),
+            use_container_width=True,
+            hide_index=True,
+            height=600
+        )
+        
+        # Summary at bottom
+        total = len(display_df)
+        failed = len(display_df[display_df['Outcome'] == 'Failed'])
+        success_rate = (total - failed) / total * 100 if total > 0 else 0
+        st.caption(f"Total: {total} conversations | Failed: {failed} ({failed/total*100:.1f}%) | Success Rate: {success_rate:.1f}%" if total > 0 else "No conversations found")
+    else:
+        st.warning("⚠️ No conversation outcome data retrieved. Please check:")
+        st.markdown("""
+        - **Have there been any traces in the selected time period?** (Most likely cause)
+        - Langfuse API credentials are correct
+        - Traces have conversation_id and tool_call data with create_ meta tools
         - Network connectivity to Langfuse
         """)
 

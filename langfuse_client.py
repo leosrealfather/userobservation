@@ -9,6 +9,7 @@ import streamlit as st
 from langfuse import Langfuse
 import pandas as pd
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Try to load .env file if python-dotenv is available
 try:
@@ -762,4 +763,320 @@ def aggregate_tool_calls_by_name(tool_calls: List[Dict]) -> pd.DataFrame:
     aggregated = aggregated.sort_values(['Company', 'Total Calls'], ascending=[True, False])
     
     return aggregated
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def fetch_conversation_outcomes(
+    _client: Langfuse,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None
+) -> List[Dict]:
+    """
+    Fetch conversation outcomes by checking if the last create_ meta tool call failed.
+    For each conversation, finds the last output containing create_ meta tools (create_campaign, 
+    create_adset, create_ad) and checks if the last create_ tool in that output failed.
+    
+    Args:
+        _client: Langfuse client instance
+        start_time: Start datetime for filtering
+        end_time: End datetime for filtering
+    
+    Returns:
+        List of conversation outcome dictionaries with:
+        - conversation_id: The conversation identifier
+        - company_name: Company name
+        - outcome: 'success' or 'failed'
+        - prompt_message: Beginning of the agent response (truncated)
+        - final_meta_tool: Name of the last create_ meta tool (e.g., 'create_campaign')
+        - timestamp: Timestamp of the output
+    """
+    if _client is None:
+        return []
+    
+    # Meta tools we're interested in
+    META_TOOLS = ['create_campaign', 'create_adset', 'create_ad']
+    
+    try:
+        # Fetch all traces to get conversation IDs and company info
+        traces = fetch_traces_by_company(_client, start_time, end_time)
+        if not traces:
+            return []
+        
+        # Get credentials for API calls
+        public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+        secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+        host = os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+        
+        # Fall back to Streamlit secrets if env vars not set
+        if not public_key or not secret_key:
+            try:
+                langfuse_config = st.secrets.get("langfuse", {})
+                public_key = public_key or langfuse_config.get("public_key", "")
+                secret_key = secret_key or langfuse_config.get("secret_key", "")
+                if host == "https://cloud.langfuse.com":
+                    host = langfuse_config.get("host", host)
+            except Exception:
+                pass
+        
+        if not public_key or not secret_key:
+            return []
+        
+        # Setup authentication
+        auth_string = f"{public_key}:{secret_key}"
+        auth_bytes = auth_string.encode('ascii')
+        auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+        headers = {
+            'Authorization': f'Basic {auth_b64}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Dictionary to store outputs for each conversation
+        # Key: conversation_id, Value: list of {timestamp, output_data, company_name, trace_id}
+        conversation_outputs = {}
+        
+        # Limit processing to prevent timeout (process max 500 traces)
+        max_traces_to_process = 500
+        traces_to_process = traces[:max_traces_to_process]
+        
+        if len(traces) > max_traces_to_process:
+            if 'debug_info' not in st.session_state:
+                st.session_state.debug_info = []
+            st.session_state.debug_info.append(f"Processing {max_traces_to_process} of {len(traces)} traces to prevent timeout")
+        
+        # Helper function to process a single trace
+        def process_trace(trace):
+            """Process a single trace and return outputs with meta tools."""
+            trace_id = trace.get('trace_id', '')
+            company_name = trace.get('company_name', 'Unknown Company')
+            conversation_id = trace.get('conversation_id', '')
+            trace_timestamp = trace.get('timestamp', datetime.now())
+            
+            if not trace_id or not conversation_id:
+                return []
+            
+            try:
+                # Fetch full trace details (reduced timeout to 5 seconds)
+                url = f"{host}/api/public/traces/{trace_id}"
+                response = requests.get(url, headers=headers, timeout=5)
+                
+                if response.status_code == 200:
+                    trace_data = response.json()
+                    
+                    # Get outputs - could be a single output, list of outputs, or in observations
+                    outputs = []
+                    if trace_data.get('outputs'):
+                        outputs = trace_data['outputs'] if isinstance(trace_data['outputs'], list) else [trace_data['outputs']]
+                    elif trace_data.get('output'):
+                        outputs = [trace_data['output']] if not isinstance(trace_data['output'], list) else trace_data['output']
+                    elif trace_data.get('observations'):
+                        observations = trace_data['observations']
+                        if isinstance(observations, list):
+                            outputs = observations
+                        else:
+                            outputs = [observations]
+                    
+                    # Process each output and collect results
+                    results = []
+                    for output in outputs:
+                        if not isinstance(output, dict):
+                            continue
+                        
+                        # Extract tool calls from this output
+                        tool_calls = []
+                        tool_call_data = output.get('tool_call') or output.get('tool_calls')
+                        if tool_call_data:
+                            if isinstance(tool_call_data, list):
+                                tool_calls = tool_call_data
+                            else:
+                                tool_calls = [tool_call_data]
+                        
+                        # Filter for meta tools only
+                        meta_tool_calls = []
+                        for tool_call in tool_calls:
+                            if not isinstance(tool_call, dict):
+                                continue
+                            
+                            tool_name = (
+                                tool_call.get('tool_name') or
+                                tool_call.get('toolName') or
+                                tool_call.get('name') or
+                                ''
+                            )
+                            
+                            # Check if it's a create_ meta tool (exact match)
+                            if tool_name in META_TOOLS:
+                                meta_tool_calls.append({
+                                    'tool_name': tool_name,
+                                    'success': bool(tool_call.get('success', True))
+                                })
+                        
+                        # Only store outputs that have meta tools
+                        if meta_tool_calls:
+                            # Extract prompt message (try various fields)
+                            prompt_message = (
+                                output.get('input') or
+                                output.get('message') or
+                                output.get('content') or
+                                output.get('text') or
+                                trace_data.get('input') or
+                                trace_data.get('name') or
+                                ''
+                            )
+                            
+                            results.append({
+                                'conversation_id': conversation_id,
+                                'timestamp': trace_timestamp,
+                                'company_name': company_name,
+                                'trace_id': trace_id,
+                                'meta_tool_calls': meta_tool_calls,
+                                'prompt_message': str(prompt_message) if prompt_message else ''
+                            })
+                    
+                    return results
+                
+                elif response.status_code == 404:
+                    return []
+                else:
+                    return []
+                    
+            except requests.exceptions.Timeout:
+                return []
+            except requests.exceptions.RequestException:
+                return []
+            except Exception as e:
+                # Log first few errors
+                if 'debug_info' not in st.session_state:
+                    st.session_state.debug_info = []
+                if len(st.session_state.debug_info) < 10:
+                    st.session_state.debug_info.append(f"Error processing trace {trace_id}: {str(e)[:100]}")
+                return []
+        
+        # Process traces in parallel using ThreadPoolExecutor
+        max_workers = 20  # Process up to 20 traces concurrently
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all trace processing tasks
+            future_to_trace = {executor.submit(process_trace, trace): trace for trace in traces_to_process}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_trace):
+                try:
+                    results = future.result()
+                    # Group results by conversation_id
+                    for result in results:
+                        conversation_id = result['conversation_id']
+                        if conversation_id not in conversation_outputs:
+                            conversation_outputs[conversation_id] = []
+                        conversation_outputs[conversation_id].append({
+                            'timestamp': result['timestamp'],
+                            'company_name': result['company_name'],
+                            'trace_id': result['trace_id'],
+                            'meta_tool_calls': result['meta_tool_calls'],
+                            'prompt_message': result['prompt_message']
+                        })
+                except Exception as e:
+                    # Handle any errors from future.result()
+                    continue
+        
+        # Process each conversation to find the last output with meta tools
+        outcomes = []
+        for conversation_id, outputs_list in conversation_outputs.items():
+            if not outputs_list:
+                continue  # Skip conversations with no meta tool outputs
+            
+            # Sort outputs by timestamp to find the last one
+            def get_timestamp(out):
+                ts = out['timestamp']
+                if isinstance(ts, datetime):
+                    return ts
+                elif isinstance(ts, str):
+                    try:
+                        return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    except:
+                        return datetime.now()
+                else:
+                    return datetime.now()
+            
+            sorted_outputs = sorted(outputs_list, key=get_timestamp, reverse=True)
+            last_output = sorted_outputs[0]
+            
+            # Get the last meta tool call in this output
+            meta_tool_calls = last_output['meta_tool_calls']
+            if not meta_tool_calls:
+                continue  # Shouldn't happen, but safety check
+            
+            last_meta_tool = meta_tool_calls[-1]  # Last in sequence
+            final_meta_tool_name = last_meta_tool['tool_name']
+            last_meta_tool_success = last_meta_tool['success']
+            
+            outcomes.append({
+                'conversation_id': conversation_id,
+                'company_name': last_output['company_name'],
+                'outcome': 'failed' if not last_meta_tool_success else 'success',
+                'prompt_message': last_output['prompt_message'],
+                'final_meta_tool': final_meta_tool_name,
+                'timestamp': last_output['timestamp'],
+                'trace_id': last_output['trace_id']
+            })
+        
+        return outcomes
+        
+    except Exception as e:
+        if 'debug_info' not in st.session_state:
+            st.session_state.debug_info = []
+        st.session_state.debug_info.append(f"Error fetching conversation outcomes: {str(e)}")
+        st.error(f"Failed to fetch conversation outcomes: {str(e)}")
+        import traceback
+        st.debug(traceback.format_exc())
+        return []
+
+
+def aggregate_conversation_outcomes(conversations: List[Dict]) -> pd.DataFrame:
+    """
+    Aggregate conversation outcomes by company.
+    Excludes test companies and calculates success rates.
+    
+    Args:
+        conversations: List of conversation outcome dictionaries
+    
+    Returns:
+        DataFrame with columns: Company, Total Conversations, Successful, Failed, Success Rate (%)
+    """
+    if not conversations:
+        return pd.DataFrame(columns=['Company', 'Total Conversations', 'Successful', 'Failed', 'Success Rate (%)'])
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(conversations)
+    
+    # Filter out test companies (case-insensitive)
+    df = df[~df['company_name'].str.lower().isin([c.lower() for c in TEST_COMPANIES])]
+    
+    if len(df) == 0:
+        return pd.DataFrame(columns=['Company', 'Total Conversations', 'Successful', 'Failed', 'Success Rate (%)'])
+    
+    # Group by company and outcome
+    aggregated = df.groupby(['company_name', 'outcome']).size().reset_index(name='count')
+    
+    # Pivot to get successful and failed counts per company
+    pivot = aggregated.pivot(index='company_name', columns='outcome', values='count').fillna(0)
+    
+    # Create result DataFrame
+    result = pd.DataFrame({
+        'Company': pivot.index,
+        'Successful': pivot.get('success', pd.Series(0, index=pivot.index)),
+        'Failed': pivot.get('failed', pd.Series(0, index=pivot.index))
+    })
+    
+    # Calculate totals and success rate
+    result['Total Conversations'] = result['Successful'] + result['Failed']
+    result['Success Rate (%)'] = (result['Successful'] / result['Total Conversations'] * 100).round(1)
+    
+    # Convert to integers
+    result['Total Conversations'] = result['Total Conversations'].astype(int)
+    result['Successful'] = result['Successful'].astype(int)
+    result['Failed'] = result['Failed'].astype(int)
+    
+    # Sort by total conversations (descending)
+    result = result.sort_values('Total Conversations', ascending=False)
+    
+    return result
 
