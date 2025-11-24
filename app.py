@@ -45,7 +45,7 @@ st.sidebar.header("Time Period Filter")
 
 time_period = st.sidebar.radio(
     "Select time period:",
-    ["Today", "This Week", "This Month", "Custom Range"],
+    ["Today", "This Week", "Last 7 Days", "This Month", "Custom Range"],
     index=0
 )
 

@@ -119,6 +119,10 @@ def get_time_range_filter(time_period: str, custom_start: Optional[datetime] = N
         # Keep in UTC - will be converted to UTC again in API call, but this ensures consistency
         start = start_utc
         end = now_utc
+    elif time_period == "last_7_days":
+        # Last 7 days from now (rolling 7-day window)
+        start = now - timedelta(days=7)
+        end = now
     elif time_period == "this_month":
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         end = now
