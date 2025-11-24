@@ -76,6 +76,7 @@ def get_time_range_filter(time_period: str, custom_start: Optional[datetime] = N
                           custom_end: Optional[datetime] = None) -> tuple[datetime, datetime]:
     """
     Get start and end datetime for the selected time period.
+    Returns timezone-aware datetimes in local timezone, which will be converted to UTC for API calls.
     
     Args:
         time_period: One of "today", "this_week", "this_month", "custom"
@@ -83,14 +84,20 @@ def get_time_range_filter(time_period: str, custom_start: Optional[datetime] = N
         custom_end: End datetime for custom range
     
     Returns:
-        Tuple of (start_datetime, end_datetime)
+        Tuple of (start_datetime, end_datetime) - timezone-aware in local timezone
     """
-    now = datetime.now()
+    # Get current time in local timezone (timezone-aware)
+    import time
+    local_offset_seconds = time.timezone if (time.daylight == 0) else time.altzone
+    local_offset = timedelta(seconds=-local_offset_seconds)
+    local_tz = timezone(local_offset)
+    now = datetime.now(local_tz)
     
     if time_period == "today":
         # Last 24 hours instead of from midnight
+        # Add a small buffer to end time to ensure we capture recent data
         start = now - timedelta(hours=24)
-        end = now
+        end = now + timedelta(minutes=1)  # Add 1 minute buffer to ensure we get recent data
     elif time_period == "this_week":
         # Start of week (Monday)
         days_since_monday = now.weekday()
@@ -101,6 +108,11 @@ def get_time_range_filter(time_period: str, custom_start: Optional[datetime] = N
         end = now
     elif time_period == "custom":
         if custom_start and custom_end:
+            # Make custom datetimes timezone-aware if they're naive
+            if custom_start.tzinfo is None:
+                custom_start = custom_start.replace(tzinfo=local_tz)
+            if custom_end.tzinfo is None:
+                custom_end = custom_end.replace(tzinfo=local_tz)
             start = custom_start
             end = custom_end
         else:
@@ -196,28 +208,57 @@ def fetch_traces_by_company(
                 # Add time filters (API uses camelCase: fromTimestamp, toTimestamp)
                 # API expects ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ (UTC)
                 if start_time:
+                    # Convert to UTC (datetimes should now be timezone-aware from get_time_range_filter)
                     if start_time.tzinfo is None:
-                        api_params["fromTimestamp"] = start_time.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                        # Fallback: if somehow still naive, treat as UTC
+                        start_utc = start_time.replace(tzinfo=timezone.utc)
                     else:
-                        start_utc = start_time.astimezone(timezone.utc).replace(tzinfo=None)
-                        api_params["fromTimestamp"] = start_utc.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                        start_utc = start_time.astimezone(timezone.utc)
+                    # Format as UTC (remove timezone info for strftime)
+                    api_params["fromTimestamp"] = start_utc.replace(tzinfo=None).strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                    # Debug: log the timestamp conversion
+                    if 'debug_info' not in st.session_state:
+                        st.session_state.debug_info = []
+                    if page == 1:  # Only log once
+                        st.session_state.debug_info.append(f"Original start_time: {start_time} (tz: {start_time.tzinfo})")
+                        st.session_state.debug_info.append(f"Converted start_utc: {start_utc}, API param: {api_params['fromTimestamp']}")
+                    
                 if end_time:
+                    # Convert to UTC (datetimes should now be timezone-aware from get_time_range_filter)
                     if end_time.tzinfo is None:
-                        api_params["toTimestamp"] = end_time.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                        # Fallback: if somehow still naive, treat as UTC
+                        end_utc = end_time.replace(tzinfo=timezone.utc)
                     else:
-                        end_utc = end_time.astimezone(timezone.utc).replace(tzinfo=None)
-                        api_params["toTimestamp"] = end_utc.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                        end_utc = end_time.astimezone(timezone.utc)
+                    # Format as UTC (remove timezone info for strftime)
+                    api_params["toTimestamp"] = end_utc.replace(tzinfo=None).strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                    # Debug: log the timestamp conversion
+                    if 'debug_info' not in st.session_state:
+                        st.session_state.debug_info = []
+                    if page == 1:  # Only log once
+                        st.session_state.debug_info.append(f"Original end_time: {end_time} (tz: {end_time.tzinfo})")
+                        st.session_state.debug_info.append(f"Converted end_utc: {end_utc}, API param: {api_params['toTimestamp']}")
                 
                 response = requests.get(url, headers=headers, params=api_params, timeout=30)
                 
                 batch = []
                 has_more = False
                 
+                # Debug: log API response
+                if 'debug_info' not in st.session_state:
+                    st.session_state.debug_info = []
+                if page == 1:  # Only log once
+                    st.session_state.debug_info.append(f"API Request URL: {url}")
+                    st.session_state.debug_info.append(f"API Request params: {api_params}")
+                    st.session_state.debug_info.append(f"API Response status: {response.status_code}")
+                
                 if response.status_code == 200:
                     data = response.json()
                     # Handle paginated response
                     if isinstance(data, dict):
                         batch = data.get('data', [])
+                        if page == 1:  # Debug: log response data
+                            st.session_state.debug_info.append(f"API Response: {len(batch)} traces in batch, total pages: {data.get('meta', {}).get('totalPages', 'unknown')}")
                         # Check for pagination info
                         if 'meta' in data and 'page' in data['meta']:
                             current_page = data['meta'].get('page', page)

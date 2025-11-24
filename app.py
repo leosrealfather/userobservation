@@ -341,8 +341,8 @@ with tab1:
     else:
         st.warning("⚠️ No data retrieved. Please check:")
         st.markdown("""
+        - **Have there been any traces in the selected time period?** (Most likely cause)
         - Langfuse API credentials are correct
-        - There are traces in the selected time period
         - Traces have company_name in their metadata
         - Network connectivity to Langfuse
         """)
@@ -486,8 +486,8 @@ with tab2:
     else:
         st.warning("⚠️ No tool call data retrieved. Please check:")
         st.markdown("""
+        - **Have there been any traces in the selected time period?** (Most likely cause)
         - Langfuse API credentials are correct
-        - There are tool calls in the selected time period
         - Tool calls have tool_name and success data in their metadata
         - Network connectivity to Langfuse
         """)
