@@ -834,18 +834,23 @@ def fetch_conversation_outcomes(
         # Key: conversation_id, Value: list of {timestamp, output_data, company_name, trace_id}
         conversation_outputs = {}
         
-        # Limit processing to prevent timeout (process max 500 traces)
-        max_traces_to_process = 500
-        traces_to_process = traces[:max_traces_to_process]
+        # Keep processing all traces, but with better rate limiting
+        # Only limit if we have an extremely large dataset (safety limit)
+        max_traces_to_process = 1000  # Increased safety limit
+        traces_to_process = traces[:max_traces_to_process] if len(traces) > max_traces_to_process else traces
         
         if len(traces) > max_traces_to_process:
             if 'debug_info' not in st.session_state:
                 st.session_state.debug_info = []
-            st.session_state.debug_info.append(f"Processing {max_traces_to_process} of {len(traces)} traces to prevent timeout")
+            st.session_state.debug_info.append(f"Processing {max_traces_to_process} of {len(traces)} traces (safety limit)")
+        else:
+            if 'debug_info' not in st.session_state:
+                st.session_state.debug_info = []
+            st.session_state.debug_info.append(f"Processing all {len(traces)} traces")
         
-        # Helper function to process a single trace
-        def process_trace(trace):
-            """Process a single trace and return outputs with meta tools."""
+        # Helper function to process a single trace with retry logic
+        def process_trace_with_retry(trace, max_retries=3):
+            """Process a single trace with retry logic for 524 errors."""
             trace_id = trace.get('trace_id', '')
             company_name = trace.get('company_name', 'Unknown Company')
             conversation_id = trace.get('conversation_id', '')
@@ -854,128 +859,179 @@ def fetch_conversation_outcomes(
             if not trace_id or not conversation_id:
                 return []
             
-            try:
-                # Fetch full trace details (reduced timeout to 5 seconds)
-                url = f"{host}/api/public/traces/{trace_id}"
-                response = requests.get(url, headers=headers, timeout=5)
-                
-                if response.status_code == 200:
-                    trace_data = response.json()
+            for attempt in range(max_retries):
+                try:
+                    # Fetch full trace details (reduced timeout to 5 seconds)
+                    url = f"{host}/api/public/traces/{trace_id}"
+                    response = requests.get(url, headers=headers, timeout=5)
                     
-                    # Get outputs - could be a single output, list of outputs, or in observations
-                    outputs = []
-                    if trace_data.get('outputs'):
-                        outputs = trace_data['outputs'] if isinstance(trace_data['outputs'], list) else [trace_data['outputs']]
-                    elif trace_data.get('output'):
-                        outputs = [trace_data['output']] if not isinstance(trace_data['output'], list) else trace_data['output']
-                    elif trace_data.get('observations'):
-                        observations = trace_data['observations']
-                        if isinstance(observations, list):
-                            outputs = observations
-                        else:
-                            outputs = [observations]
-                    
-                    # Process each output and collect results
-                    results = []
-                    for output in outputs:
-                        if not isinstance(output, dict):
-                            continue
+                    if response.status_code == 200:
+                        trace_data = response.json()
                         
-                        # Extract tool calls from this output
-                        tool_calls = []
-                        tool_call_data = output.get('tool_call') or output.get('tool_calls')
-                        if tool_call_data:
-                            if isinstance(tool_call_data, list):
-                                tool_calls = tool_call_data
+                        # Get outputs - could be a single output, list of outputs, or in observations
+                        outputs = []
+                        if trace_data.get('outputs'):
+                            outputs = trace_data['outputs'] if isinstance(trace_data['outputs'], list) else [trace_data['outputs']]
+                        elif trace_data.get('output'):
+                            outputs = [trace_data['output']] if not isinstance(trace_data['output'], list) else trace_data['output']
+                        elif trace_data.get('observations'):
+                            observations = trace_data['observations']
+                            if isinstance(observations, list):
+                                outputs = observations
                             else:
-                                tool_calls = [tool_call_data]
+                                outputs = [observations]
                         
-                        # Filter for meta tools only
-                        meta_tool_calls = []
-                        for tool_call in tool_calls:
-                            if not isinstance(tool_call, dict):
+                        # Process each output and collect results
+                        results = []
+                        for output in outputs:
+                            if not isinstance(output, dict):
                                 continue
                             
-                            tool_name = (
-                                tool_call.get('tool_name') or
-                                tool_call.get('toolName') or
-                                tool_call.get('name') or
-                                ''
-                            )
+                            # Extract tool calls from this output
+                            tool_calls = []
+                            tool_call_data = output.get('tool_call') or output.get('tool_calls')
+                            if tool_call_data:
+                                if isinstance(tool_call_data, list):
+                                    tool_calls = tool_call_data
+                                else:
+                                    tool_calls = [tool_call_data]
                             
-                            # Check if it's a create_ meta tool (exact match)
-                            if tool_name in META_TOOLS:
-                                meta_tool_calls.append({
-                                    'tool_name': tool_name,
-                                    'success': bool(tool_call.get('success', True))
+                            # Filter for meta tools only
+                            meta_tool_calls = []
+                            for tool_call in tool_calls:
+                                if not isinstance(tool_call, dict):
+                                    continue
+                                
+                                tool_name = (
+                                    tool_call.get('tool_name') or
+                                    tool_call.get('toolName') or
+                                    tool_call.get('name') or
+                                    ''
+                                )
+                                
+                                # Check if it's a create_ meta tool (exact match)
+                                if tool_name in META_TOOLS:
+                                    meta_tool_calls.append({
+                                        'tool_name': tool_name,
+                                        'success': bool(tool_call.get('success', True))
+                                    })
+                            
+                            # Only store outputs that have meta tools
+                            if meta_tool_calls:
+                                # Extract prompt message (try various fields)
+                                prompt_message = (
+                                    output.get('input') or
+                                    output.get('message') or
+                                    output.get('content') or
+                                    output.get('text') or
+                                    trace_data.get('input') or
+                                    trace_data.get('name') or
+                                    ''
+                                )
+                                
+                                results.append({
+                                    'conversation_id': conversation_id,
+                                    'timestamp': trace_timestamp,
+                                    'company_name': company_name,
+                                    'trace_id': trace_id,
+                                    'meta_tool_calls': meta_tool_calls,
+                                    'prompt_message': str(prompt_message) if prompt_message else ''
                                 })
                         
-                        # Only store outputs that have meta tools
-                        if meta_tool_calls:
-                            # Extract prompt message (try various fields)
-                            prompt_message = (
-                                output.get('input') or
-                                output.get('message') or
-                                output.get('content') or
-                                output.get('text') or
-                                trace_data.get('input') or
-                                trace_data.get('name') or
-                                ''
-                            )
-                            
-                            results.append({
-                                'conversation_id': conversation_id,
-                                'timestamp': trace_timestamp,
-                                'company_name': company_name,
-                                'trace_id': trace_id,
-                                'meta_tool_calls': meta_tool_calls,
-                                'prompt_message': str(prompt_message) if prompt_message else ''
-                            })
+                        return results
                     
-                    return results
+                    elif response.status_code == 404:
+                        return []
+                    elif response.status_code == 524:
+                        # Cloudflare timeout - retry with exponential backoff
+                        if attempt < max_retries - 1:
+                            import time
+                            wait_time = (2 ** attempt) * 1.0  # 1s, 2s, 4s
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            # Last attempt failed, return empty
+                            if 'debug_info' not in st.session_state:
+                                st.session_state.debug_info = []
+                            if len(st.session_state.debug_info) < 20:
+                                st.session_state.debug_info.append(f"Trace {trace_id} failed after {max_retries} retries (524 timeout)")
+                            return []
+                    else:
+                        # Other error status codes - don't retry
+                        return []
+                        
+                except requests.exceptions.Timeout:
+                    # Request timeout - retry with exponential backoff
+                    if attempt < max_retries - 1:
+                        import time
+                        wait_time = (2 ** attempt) * 1.0
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return []
+                except requests.exceptions.RequestException:
+                    # Network error - retry with exponential backoff
+                    if attempt < max_retries - 1:
+                        import time
+                        wait_time = (2 ** attempt) * 1.0
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return []
+                except Exception as e:
+                    # Other errors - log and return empty
+                    if 'debug_info' not in st.session_state:
+                        st.session_state.debug_info = []
+                    if len(st.session_state.debug_info) < 10:
+                        st.session_state.debug_info.append(f"Error processing trace {trace_id}: {str(e)[:100]}")
+                    return []
+            
+            return []
+        
+        # Process traces in parallel with balanced concurrency to avoid overwhelming the API
+        max_workers = 8  # Balanced: reduced from 20 but not as slow as 5
+        batch_size = 40  # Larger batches = fewer delays
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Process in batches to add delays and prevent overwhelming the API
+            total_batches = (len(traces_to_process) + batch_size - 1) // batch_size
+            for batch_num, batch_start in enumerate(range(0, len(traces_to_process), batch_size), 1):
+                batch_end = min(batch_start + batch_size, len(traces_to_process))
+                batch = traces_to_process[batch_start:batch_end]
                 
-                elif response.status_code == 404:
-                    return []
-                else:
-                    return []
-                    
-            except requests.exceptions.Timeout:
-                return []
-            except requests.exceptions.RequestException:
-                return []
-            except Exception as e:
-                # Log first few errors
+                # Log progress
                 if 'debug_info' not in st.session_state:
                     st.session_state.debug_info = []
-                if len(st.session_state.debug_info) < 10:
-                    st.session_state.debug_info.append(f"Error processing trace {trace_id}: {str(e)[:100]}")
-                return []
-        
-        # Process traces in parallel using ThreadPoolExecutor
-        max_workers = 20  # Process up to 20 traces concurrently
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all trace processing tasks
-            future_to_trace = {executor.submit(process_trace, trace): trace for trace in traces_to_process}
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_trace):
-                try:
-                    results = future.result()
-                    # Group results by conversation_id
-                    for result in results:
-                        conversation_id = result['conversation_id']
-                        if conversation_id not in conversation_outputs:
-                            conversation_outputs[conversation_id] = []
-                        conversation_outputs[conversation_id].append({
-                            'timestamp': result['timestamp'],
-                            'company_name': result['company_name'],
-                            'trace_id': result['trace_id'],
-                            'meta_tool_calls': result['meta_tool_calls'],
-                            'prompt_message': result['prompt_message']
-                        })
-                except Exception as e:
-                    # Handle any errors from future.result()
-                    continue
+                if batch_num == 1 or batch_num % 5 == 0 or batch_num == total_batches:
+                    st.session_state.debug_info.append(f"Processing batch {batch_num} of {total_batches} ({len(batch)} traces)")
+                
+                # Submit batch tasks
+                future_to_trace = {executor.submit(process_trace_with_retry, trace): trace for trace in batch}
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_trace):
+                    try:
+                        results = future.result()
+                        # Group results by conversation_id
+                        for result in results:
+                            conversation_id = result['conversation_id']
+                            if conversation_id not in conversation_outputs:
+                                conversation_outputs[conversation_id] = []
+                            conversation_outputs[conversation_id].append({
+                                'timestamp': result['timestamp'],
+                                'company_name': result['company_name'],
+                                'trace_id': result['trace_id'],
+                                'meta_tool_calls': result['meta_tool_calls'],
+                                'prompt_message': result['prompt_message']
+                            })
+                    except Exception as e:
+                        # Handle any errors from future.result()
+                        continue
+                
+                # Add a delay between batches to avoid overwhelming the API
+                if batch_end < len(traces_to_process):
+                    import time
+                    time.sleep(0.3)  # 300ms delay between batches
         
         # Process each conversation to find the last output with meta tools
         outcomes = []
